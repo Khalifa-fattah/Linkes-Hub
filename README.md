@@ -2,6 +2,7 @@
 
 ## الملفات
 - index.html / style.css / app.js : الواجهة والمنطق
+- vault.js : الخزينة السرية المشفرة (Web Crypto / AES-GCM) لحفظ مفاتيح API والرموز بكلمة سر
 - sync.js : الدمج والمزامنة مع Google Drive
 - sw.js : عمل التطبيق بدون إنترنت (Service Worker)
 - manifest.webmanifest + icons/ : التثبيت كتطبيق

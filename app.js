@@ -242,6 +242,7 @@
         clearTimeout(toastTimer);
         toastTimer = setTimeout(() => el.toast.classList.remove('show'), action ? 5500 : 2600);
     }
+    window.LinkVaultToast = (msg, type = 'ok') => toast(msg, { type });
 
     /* =====================================================================
        الطبقات: sheet / modal
@@ -686,6 +687,7 @@
         const light = document.documentElement.dataset.theme === 'light';
         const items = [
             { icon: 'folder-plus', label: 'تصنيف جديد', fn: () => openNameModal({ mode: 'new-cat' }, 'تصنيف جديد', '', 'اسم التصنيف') },
+            { icon: 'key', label: 'الخزينة السرية (مفاتيح ورموز)', fn: () => window.LinkVault && window.LinkVault.open() },
             { icon: 'undo', label: 'تراجع عن آخر إجراء', disabled: !undoStack.length, fn: undo },
             { icon: light ? 'moon' : 'sun', label: light ? 'المظهر الداكن' : 'المظهر الفاتح', fn: toggleTheme },
             { icon: 'cloud', label: 'المزامنة والنسخ الاحتياطي', fn: openSyncPanel }
@@ -1016,6 +1018,9 @@
     // استلام نسخة مدمجة من المزامنة
     function applyRemote(doc) {
         if (dragging) { pendingRemote = doc; return; }
+        if (doc && doc.vault && window.LinkVault && window.LinkVault.setRawEncrypted) {
+            window.LinkVault.setRawEncrypted(doc.vault);
+        }
         db = sanitizeDb(doc, 0);
         saveLocal();
         if (view.name === 'detail' && !findSrv(view.catId, view.srvId)) { view = { name: 'home', catId: null, srvId: null }; }
@@ -1026,7 +1031,12 @@
        نسخ احتياطي يدوي
        ===================================================================== */
     function exportData() {
-        const blob = new Blob([JSON.stringify(db, null, 2)], { type: 'application/json' });
+        const payload = Object.assign({}, db);
+        if (window.LinkVault && window.LinkVault.getRawEncrypted) {
+            const v = window.LinkVault.getRawEncrypted();
+            if (v) payload.vault = v;
+        }
+        const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
         const a = document.createElement('a');
         a.href = URL.createObjectURL(blob);
         a.download = `link-hub-backup-${new Date().toISOString().slice(0, 10)}.json`;
@@ -1040,6 +1050,9 @@
         reader.onload = () => {
             try {
                 const parsed = JSON.parse(reader.result);
+                if (parsed && parsed.vault && window.LinkVault && window.LinkVault.setRawEncrypted) {
+                    window.LinkVault.setRawEncrypted(parsed.vault);
+                }
                 const imported = sanitizeDb(parsed, now());
                 if (!imported.categories.length) { toast('الملف لا يحتوي بيانات صالحة', { type: 'err' }); return; }
                 pushUndo();
@@ -1254,7 +1267,14 @@
         loadSortable().then(() => initSortable());
 
         LinkSync.init({
-            getDoc: () => db,
+            getDoc: () => {
+                const doc = Object.assign({}, db);
+                if (window.LinkVault && window.LinkVault.getRawEncrypted) {
+                    const v = window.LinkVault.getRawEncrypted();
+                    if (v) doc.vault = v;
+                }
+                return doc;
+            },
             sanitize: d => sanitizeDb(d, 0),
             applyDoc: applyRemote,
             onStatus: updateSyncUi

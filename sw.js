@@ -4,13 +4,13 @@
  * - طلبات Google Drive/الحساب لا يتدخل فيها أبداً.
  * عند تعديل ملفات التطبيق غيّر رقم VERSION ليصل التحديث للمستخدمين.
  */
-const VERSION = 'v3.0.0';
+const VERSION = 'v3.1.0';
 const SHELL_CACHE = `linkhub-shell-${VERSION}`;
 const RUNTIME_CACHE = 'linkhub-runtime-v1';
 const RUNTIME_MAX = 300;
 
 const SHELL = [
-    './', 'index.html', 'style.css', 'app.js', 'sync.js', 'manifest.webmanifest',
+    './', 'index.html', 'style.css', 'app.js', 'vault.js', 'sync.js', 'manifest.webmanifest',
     'icons/icon.svg', 'icons/icon-192.png', 'icons/icon-512.png', 'icons/apple-touch-icon.png'
 ];
 const OPTIONAL = ['vendor/Sortable.min.js'];

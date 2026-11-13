@@ -138,7 +138,12 @@
       return cat;
     });
 
-    return { v: 3, catsU: Math.max(num(a.catsU), num(b.catsU)), categories, tombstones: tomb };
+    const out = { v: 3, catsU: Math.max(num(a.catsU), num(b.catsU)), categories, tombstones: tomb };
+    const va = a && a.vault, vb = b && b.vault;
+    if (va || vb) {
+      out.vault = (!va) ? vb : (!vb) ? va : ((num(vb.u)) > (num(va.u)) ? vb : va);
+    }
+    return out;
   }
 
   /* ------------------------------------------------------------------ */
