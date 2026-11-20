@@ -1,38 +1,50 @@
 /**
- * Link Hub — المزامنة السحابية (Google Drive / appDataFolder)
+ * Link Hub — المزامنة السحابية
+ * تدعم مزودين:
+ *  1. Google Drive (مجلد التطبيق الخاص appDataFolder)
+ *  2. GitHub Gist (Secret Gist دائم الصلاحية عبر Personal Access Token)
  *
  * الفكرة:
  *  - كل عنصر (تصنيف / موقع / رابط) له حقل u = وقت آخر تعديل.
- *  - الحذف يُسجَّل في tombstones (id → وقت الحذف) حتى لا يعود العنصر المحذوف من جهاز آخر.
- *  - عند المزامنة: تنزيل ← دمج على مستوى العنصر ← رفع إن اختلفت النتيجة.
- *    فلا يضيع أي تعديل حتى لو عدّلت من جهازين.
- *  - يُحفظ الملف داخل مجلد التطبيق الخاص (appDataFolder) ولا يظهر في ملفات Drive العادية،
- *    والصلاحية المطلوبة drive.appdata فقط (لا يستطيع التطبيق رؤية بقية ملفاتك).
+ *  - الحذف يُسجَّل في tombstones لتعمل المزامنة بالدمج الدقيق (LWW).
+ *  - يتم دمج الخزينة المشفرة (vault) تلقائياً بالأحدث زمناً.
  */
 (function (root) {
   'use strict';
 
-  // ضع هنا معرّف العميل (Client ID) مرة واحدة ليعمل على كل أجهزتك دون إدخاله يدوياً.
-  // أو اتركه فارغاً وأدخله من: القائمة ← المزامنة.
+  // معرّف العميل الافتراضي لـ Google Drive
   const DEFAULT_CLIENT_ID = '952971060139-a996b1mbvik9v7jr02l0rccj24j22q5e.apps.googleusercontent.com';
 
   const FILE_NAME = 'linkhub-data.json';
   const SCOPE = 'https://www.googleapis.com/auth/drive.appdata';
   const UNSORTED_ID = 'cat-unsorted';
-  const TOMB_TTL = 120 * 24 * 3600 * 1000; // تُحذف سجلات الحذف بعد 120 يوماً
+  const TOMB_TTL = 120 * 24 * 3600 * 1000; // 120 يوماً
   const POLL_MS = 90 * 1000;
 
   const LS = {
+    provider: 'lh_sync_provider', // 'drive' أو 'gist'
+    // Google Drive
     clientId: 'lh_client_id',
     token: 'lh_token',
     connected: 'lh_connected',
     fileId: 'lh_file_id',
-    last: 'lh_last_sync'
+    last: 'lh_last_sync',
+    // GitHub Gist
+    gistToken: 'lh_gist_token',
+    gistId: 'lh_gist_id',
+    gistConnected: 'lh_gist_connected',
+    gistLast: 'lh_gist_last_sync'
   };
 
   /* ------------------------------------------------------------------ */
   /*  أدوات                                                              */
   /* ------------------------------------------------------------------ */
+  const ls = {
+    get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+    set(k, v) { try { localStorage.setItem(k, v); } catch (e) { /* ignore */ } },
+    del(k) { try { localStorage.removeItem(k); } catch (e) { /* ignore */ } }
+  };
+
   function stable(v) {
     if (Array.isArray(v)) return '[' + v.map(stable).join(',') + ']';
     if (v && typeof v === 'object') {
@@ -46,7 +58,7 @@
   const num = x => (typeof x === 'number' && isFinite(x) ? x : 0);
 
   /* ------------------------------------------------------------------ */
-  /*  الدمج                                                              */
+  /*  الدمج (Conflict-free LWW Merge)                                    */
   /* ------------------------------------------------------------------ */
   function indexDoc(doc) {
     const cats = new Map(), srvs = new Map(), lnks = new Map();
@@ -60,19 +72,17 @@
     return { cats, srvs, lnks };
   }
 
-  // يختار النسخة الأحدث لكل id، ويحذف ما سُجّل حذفه بعد آخر تعديل عليه
   function pick(ma, mb, tomb) {
     const out = new Map();
     new Set([...ma.keys(), ...mb.keys()]).forEach(id => {
       const x = ma.get(id), y = mb.get(id);
-      const w = !x ? y : !y ? x : (y.u > x.u ? y : x); // عند التساوي تفوز النسخة المحلية (a)
+      const w = !x ? y : !y ? x : (y.u > x.u ? y : x);
       if (tomb[id] !== undefined && tomb[id] >= w.u) return;
       out.set(id, { item: w.item, u: w.u, parent: w.parent });
     });
     return out;
   }
 
-  // ترتيب العناصر: من القائمة صاحبة ختم الترتيب الأحدث، ثم ما تبقّى
   function order(la, sa, lb, sb, valid) {
     const first = sb > sa ? lb : la, second = sb > sa ? la : lb;
     const ok = new Set(valid), seen = new Set(), out = [];
@@ -95,7 +105,6 @@
     const srvs = pick(A.srvs, B.srvs, tomb);
     const lnks = pick(A.lnks, B.lnks, tomb);
 
-    // موقع فُقد تصنيفه بسبب حذف، لكنه عُدّل بعد الحذف ← ننقله إلى «غير مصنف» بدل أن يضيع
     srvs.forEach((w, id) => {
       if (cats.has(w.parent)) return;
       if (w.u > (tomb[w.parent] || 0)) {
@@ -139,6 +148,7 @@
     });
 
     const out = { v: 3, catsU: Math.max(num(a.catsU), num(b.catsU)), categories, tombstones: tomb };
+    // دمج الخزينة المشفرة بالأحدث
     const va = a && a.vault, vb = b && b.vault;
     if (va || vb) {
       out.vault = (!va) ? vb : (!vb) ? va : ((num(vb.u)) > (num(va.u)) ? vb : va);
@@ -147,7 +157,7 @@
   }
 
   /* ------------------------------------------------------------------ */
-  /*  الحالة والإعداد                                                    */
+  /*  الحالة والمزود                                                     */
   /* ------------------------------------------------------------------ */
   let cfg = null;               // { getDoc, sanitize, applyDoc, onStatus }
   let tokenClient = null;
@@ -157,26 +167,44 @@
   let again = false;
   let timer = null;
   let started = false;
-  let status = { state: 'off', time: 0, message: '' };
+  let status = { state: 'off', provider: 'drive', time: 0, message: '' };
 
-  const ls = {
-    get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
-    set(k, v) { try { localStorage.setItem(k, v); } catch (e) { /* ignore */ } },
-    del(k) { try { localStorage.removeItem(k); } catch (e) { /* ignore */ } }
-  };
+  function getProvider() {
+    const p = ls.get(LS.provider);
+    if (p === 'gist' || p === 'drive') return p;
+    if (ls.get(LS.gistConnected) === '1') return 'gist';
+    if (ls.get(LS.connected) === '1') return 'drive';
+    return 'drive';
+  }
+
+  function setProvider(p) {
+    if (p === 'gist' || p === 'drive') {
+      ls.set(LS.provider, p);
+      setStatus(baseState());
+    }
+  }
 
   const getClientId = () => (ls.get(LS.clientId) || DEFAULT_CLIENT_ID || '').trim();
-  const isConnected = () => !!getClientId() && ls.get(LS.connected) === '1';
+  const getGistToken = () => (ls.get(LS.gistToken) || '').trim();
+  const getGistId = () => (ls.get(LS.gistId) || '').trim();
+
+  function isConnected() {
+    const p = getProvider();
+    if (p === 'gist') return !!getGistToken() && ls.get(LS.gistConnected) === '1';
+    return !!getClientId() && ls.get(LS.connected) === '1';
+  }
 
   function setStatus(state, message) {
-    status = { state, time: Number(ls.get(LS.last)) || 0, message: message || '' };
+    const p = getProvider();
+    const lastTime = p === 'gist' ? Number(ls.get(LS.gistLast)) || 0 : Number(ls.get(LS.last)) || 0;
+    status = { state, provider: p, time: lastTime, message: message || '' };
     if (cfg && cfg.onStatus) cfg.onStatus(status);
   }
 
   function baseState() { return isConnected() ? 'ok' : 'off'; }
 
   /* ------------------------------------------------------------------ */
-  /*  التوكن (Google Identity Services)                                  */
+  /*  1) Google Drive                                                    */
   /* ------------------------------------------------------------------ */
   function readToken() {
     try {
@@ -222,17 +250,21 @@
     }));
   }
 
-  async function ensureToken(opts) {
+  async function ensureDriveToken(opts) {
     const t = readToken();
     if (t) return t;
-    if (opts && (opts.interactive || opts.silentAuth)) return requestToken(!!opts.interactive);
-    throw new Error('auth');
+    // محاولة التجديد الصامت التلقائي في الخلفية أولاً دون مقاطعة المستخدم
+    try {
+      return await requestToken(false);
+    } catch (e) {
+      if (opts && (opts.interactive || opts.silentAuth)) {
+        return await requestToken(!!opts.interactive);
+      }
+      throw new Error('auth');
+    }
   }
 
-  /* ------------------------------------------------------------------ */
-  /*  Drive REST                                                         */
-  /* ------------------------------------------------------------------ */
-  async function api(url, init) {
+  async function driveApi(url, init) {
     const token = readToken();
     if (!token) throw new Error('auth');
     const res = await fetch(url, Object.assign({}, init, {
@@ -242,30 +274,29 @@
     return res;
   }
 
-  async function findFile() {
+  async function findDriveFile() {
     const q = encodeURIComponent("name='" + FILE_NAME + "'");
-    const res = await api('https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&q=' + q +
+    const res = await driveApi('https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&q=' + q +
       '&fields=files(id,modifiedTime)&orderBy=modifiedTime%20desc&pageSize=1');
     if (!res.ok) throw new Error('http-' + res.status);
     const data = await res.json();
     return (data.files && data.files[0]) || null;
   }
 
-  // يعيد undefined إن كان الملف غير موجود (404)
-  async function downloadFile(id) {
-    const res = await api('https://www.googleapis.com/drive/v3/files/' + id + '?alt=media');
+  async function downloadDriveFile(id) {
+    const res = await driveApi('https://www.googleapis.com/drive/v3/files/' + id + '?alt=media');
     if (res.status === 404) return undefined;
     if (!res.ok) throw new Error('http-' + res.status);
     return res.json();
   }
 
-  async function createFile(doc) {
+  async function createDriveFile(doc) {
     const boundary = 'lh' + Date.now().toString(36);
     const body = '--' + boundary + '\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n' +
       JSON.stringify({ name: FILE_NAME, parents: ['appDataFolder'], mimeType: 'application/json' }) +
       '\r\n--' + boundary + '\r\nContent-Type: application/json\r\n\r\n' + JSON.stringify(doc) +
       '\r\n--' + boundary + '--';
-    const res = await api('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id', {
+    const res = await driveApi('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id', {
       method: 'POST',
       headers: { 'Content-Type': 'multipart/related; boundary=' + boundary },
       body
@@ -274,8 +305,8 @@
     return (await res.json()).id;
   }
 
-  async function updateFile(id, doc) {
-    const res = await api('https://www.googleapis.com/upload/drive/v3/files/' + id + '?uploadType=media', {
+  async function updateDriveFile(id, doc) {
+    const res = await driveApi('https://www.googleapis.com/upload/drive/v3/files/' + id + '?uploadType=media', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(doc)
@@ -284,48 +315,159 @@
   }
 
   /* ------------------------------------------------------------------ */
-  /*  المزامنة                                                           */
+  /*  2) GitHub Gist                                                     */
+  /* ------------------------------------------------------------------ */
+  async function gistApi(endpoint, init = {}) {
+    const token = getGistToken();
+    if (!token) throw new Error('auth');
+    const headers = Object.assign({
+      'Accept': 'application/vnd.github.v3+json',
+      'Authorization': 'token ' + token,
+      'X-GitHub-Api-Version': '2022-11-28'
+    }, init.headers || {});
+
+    const res = await fetch('https://api.github.com' + endpoint, Object.assign({}, init, { headers }));
+    if (res.status === 401 || res.status === 403) throw new Error('auth');
+    return res;
+  }
+
+  async function findExistingGist() {
+    const res = await gistApi('/gists?per_page=50');
+    if (!res.ok) throw new Error('http-' + res.status);
+    const list = await res.json();
+    if (!Array.isArray(list)) return null;
+    const found = list.find(g => (g.files && g.files[FILE_NAME]) || (g.description && g.description.includes('Link Hub')));
+    return found ? found.id : null;
+  }
+
+  async function downloadGist(id) {
+    const res = await gistApi('/gists/' + id);
+    if (res.status === 404) return undefined;
+    if (!res.ok) throw new Error('http-' + res.status);
+    const data = await res.json();
+    const file = data.files && data.files[FILE_NAME];
+    if (!file) return undefined;
+    if (file.truncated && file.raw_url) {
+      const rawRes = await fetch(file.raw_url);
+      return rawRes.json();
+    }
+    return JSON.parse(file.content);
+  }
+
+  async function createGist(doc) {
+    const res = await gistApi('/gists', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        description: 'Link Hub Sync Data (Private Backup)',
+        public: false,
+        files: {
+          [FILE_NAME]: {
+            content: JSON.stringify(doc, null, 2)
+          }
+        }
+      })
+    });
+    if (!res.ok) throw new Error('http-' + res.status);
+    const data = await res.json();
+    return data.id;
+  }
+
+  async function updateGist(id, doc) {
+    const res = await gistApi('/gists/' + id, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        files: {
+          [FILE_NAME]: {
+            content: JSON.stringify(doc, null, 2)
+          }
+        }
+      })
+    });
+    if (!res.ok) throw new Error('http-' + res.status);
+  }
+
+  /* ------------------------------------------------------------------ */
+  /*  المزامنة الموحدة                                                   */
   /* ------------------------------------------------------------------ */
   async function syncNow(opts) {
     if (!cfg || !isConnected()) return;
     if (syncing) { again = true; return; }
     syncing = true;
     setStatus('busy');
+
     try {
       if (typeof navigator !== 'undefined' && navigator.onLine === false) throw new Error('offline');
-      await ensureToken(opts);
 
-      let fileId = ls.get(LS.fileId);
+      const p = getProvider();
       let remote = null;
-      if (fileId) {
-        remote = await downloadFile(fileId);
-        if (remote === undefined) { fileId = null; remote = null; ls.del(LS.fileId); }
-      }
-      if (!fileId) {
-        const f = await findFile();
-        if (f) { fileId = f.id; remote = await downloadFile(fileId); }
-      }
-      if (remote !== null && remote !== undefined) remote = cfg.sanitize(remote);
 
-      // نقرأ النسخة المحلية بعد انتهاء التنزيل مباشرة حتى لا نكتب فوق تعديل حدث أثناء الانتظار
-      const local = cfg.getDoc();
-      const merged = remote ? merge(local, remote) : local;
-      const mergedStr = stable(merged);
+      if (p === 'gist') {
+        let gistId = getGistId();
+        if (gistId) {
+          remote = await downloadGist(gistId);
+          if (remote === undefined) { gistId = null; remote = null; ls.del(LS.gistId); }
+        }
+        if (!gistId) {
+          gistId = await findExistingGist();
+          if (gistId) remote = await downloadGist(gistId);
+        }
+        if (remote !== null && remote !== undefined) remote = cfg.sanitize(remote);
 
-      if (stable(local) !== mergedStr) cfg.applyDoc(merged);
+        const local = cfg.getDoc();
+        const merged = remote ? merge(local, remote) : local;
+        const mergedStr = stable(merged);
 
-      if (!remote || stable(remote) !== mergedStr) {
-        if (fileId) await updateFile(fileId, merged);
-        else fileId = await createFile(merged);
+        if (stable(local) !== mergedStr) cfg.applyDoc(merged);
+
+        if (!remote || stable(remote) !== mergedStr) {
+          if (gistId) await updateGist(gistId, merged);
+          else gistId = await createGist(merged);
+        }
+        ls.set(LS.gistId, gistId);
+        ls.set(LS.gistLast, String(Date.now()));
+        setStatus('ok');
+
+      } else {
+        // Google Drive
+        await ensureDriveToken(opts);
+
+        let fileId = ls.get(LS.fileId);
+        if (fileId) {
+          remote = await downloadDriveFile(fileId);
+          if (remote === undefined) { fileId = null; remote = null; ls.del(LS.fileId); }
+        }
+        if (!fileId) {
+          const f = await findDriveFile();
+          if (f) { fileId = f.id; remote = await downloadDriveFile(fileId); }
+        }
+        if (remote !== null && remote !== undefined) remote = cfg.sanitize(remote);
+
+        const local = cfg.getDoc();
+        const merged = remote ? merge(local, remote) : local;
+        const mergedStr = stable(merged);
+
+        if (stable(local) !== mergedStr) cfg.applyDoc(merged);
+
+        if (!remote || stable(remote) !== mergedStr) {
+          if (fileId) await updateDriveFile(fileId, merged);
+          else fileId = await createDriveFile(merged);
+        }
+        ls.set(LS.fileId, fileId);
+        ls.set(LS.last, String(Date.now()));
+        setStatus('ok');
       }
-      ls.set(LS.fileId, fileId);
-      ls.set(LS.last, String(Date.now()));
-      setStatus('ok');
+
     } catch (e) {
       const m = String(e && e.message || e);
-      if (m === 'auth') setStatus('auth');
-      else if (m === 'offline' || e instanceof TypeError) setStatus('offline');
-      else setStatus('error', m);
+      if (m === 'auth') {
+        setStatus('auth', getProvider() === 'gist' ? 'رمز GitHub غير صالح أو منتهي' : '');
+      } else if (m === 'offline' || e instanceof TypeError) {
+        setStatus('offline');
+      } else {
+        setStatus('error', m);
+      }
     } finally {
       syncing = false;
       if (again) { again = false; schedule(400); }
@@ -348,8 +490,10 @@
     else setStatus('off');
   }
 
+  // Google Drive connect / disconnect
   async function connect() {
     if (!getClientId()) return;
+    ls.set(LS.provider, 'drive');
     ls.set(LS.connected, '1');
     await syncNow({ interactive: true });
   }
@@ -369,11 +513,30 @@
     setStatus(baseState());
   }
 
+  // GitHub Gist connect / disconnect
+  async function connectGist(token) {
+    const t = String(token || '').trim();
+    if (!t) throw new Error('أدخل رمز GitHub');
+    ls.set(LS.gistToken, t);
+    ls.set(LS.gistConnected, '1');
+    ls.set(LS.provider, 'gist');
+    setStatus('busy');
+    await syncNow({});
+  }
+
+  function disconnectGist() {
+    [LS.gistToken, LS.gistConnected, LS.gistId, LS.gistLast].forEach(ls.del);
+    setStatus('off');
+  }
+
   function init(config) { cfg = config; }
 
   const api_ = {
-    init, start, schedule, syncNow, connect, disconnect, setClientId,
-    getClientId, isConnected, merge, stable,
+    init, start, schedule, syncNow,
+    getProvider, setProvider,
+    connect, disconnect, setClientId, getClientId,
+    connectGist, disconnectGist, getGistToken, getGistId,
+    isConnected, merge, stable,
     status: () => status,
     UNSORTED_ID
   };
